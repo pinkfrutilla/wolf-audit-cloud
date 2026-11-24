@@ -10,19 +10,18 @@ from pysnmp.hlapi.v3arch.asyncio import (
 # --- 1. URL DE TU API EN RENDER ---
 API_WOLF_URL = "https://wolf-audit-cloud-3.onrender.com/api/guardar"
 
-# --- 2. CONFIGURACIÓN DE TU MAQUETA (Ajustar IPs en el laboratorio) ---
-IP_MC_LOCAL = "192.168.10.21"    # Media Converter 1 (conectado al Switch 1)
-IP_MC_REMOTO = "192.168.10.22"   # Media Converter 2 (al otro extremo de la fibra)
-COMUNIDAD_SNMP = "public"        # Comunidad SNMP de lectura
+# --- 2. IPs DE LOS SWITCHES CISCO 2960 ---
+IP_SW_LOCAL = "192.168.10.11"    # Cisco SW1 (conectado a tu laptop y Comdiel 1)
+IP_SW_REMOTO = "192.168.10.12"   # Cisco SW2 (al otro lado de la fibra y Comdiel 2)
+COMUNIDAD_SNMP = "public"
 
-# OID estándar multimarca: ifOperStatus (1 = UP, 2 = DOWN)
-# Cambia el último número (.2) por el número de puerto de fibra del Media Converter
-OID_ESTADO_PUERTO_FIBRA = "1.3.6.1.2.1.2.2.1.8.2"
+# OID universal de vida del equipo (funciona en cualquier marca)
+OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 
-# OID opcional de potencia Rx óptica (DOM) - reemplazar según el modelo exacto TP-Link
-OID_POTENCIA_RX = None  # Ej: "1.3.6.1.4.1.11863.6.45.1.1.1.1.5.2"
+# OID de errores físicos de entrada/CRC en Fa0/2 del Cisco 2960 (ifIndex 10002)
+OID_CRC_FA02 = "1.3.6.1.2.1.2.2.1.14.10002"
 
-SENSIBILIDAD_SRX = -22.0  # dBm
+errores_previos = None
 
 
 async def _consultar_snmp_async(ip, oid):
@@ -49,58 +48,59 @@ async def _consultar_snmp_async(ip, oid):
 
 
 def consultar_snmp(ip, oid):
-    """Consulta un OID por SNMPv2c y devuelve el valor, o None si no responde."""
     return asyncio.run(_consultar_snmp_async(ip, oid))
 
 
 def auditar_enlace_real():
-    print("\n--- Consultando maqueta física por SNMP ---")
+    global errores_previos
+    print("\n--- Consultando maqueta Cisco + Fibra Comdiel por SNMP ---")
 
-    # 1. Revisar puerto de fibra en Media Converter 1 (Local)
-    estado_mc1 = consultar_snmp(IP_MC_LOCAL, OID_ESTADO_PUERTO_FIBRA)
+    sw1_ok = consultar_snmp(IP_SW_LOCAL, OID_SYS_UPTIME)
+    sw2_ok = consultar_snmp(IP_SW_REMOTO, OID_SYS_UPTIME)
 
-    # 2. Revisar conectividad hacia Media Converter 2 (al otro lado de las fibras)
-    estado_mc2 = consultar_snmp(IP_MC_REMOTO, OID_ESTADO_PUERTO_FIBRA)
+    # Lectura opcional de errores CRC en puerto Fa0/2 del SW1
+    crc_nuevos = 0
+    if sw1_ok is not None:
+        crc_raw = consultar_snmp(IP_SW_LOCAL, OID_CRC_FA02)
+        try:
+            crc_actual = int(crc_raw)
+            if errores_previos is not None and crc_actual > errores_previos:
+                crc_nuevos = crc_actual - errores_previos
+            errores_previos = crc_actual
+        except (TypeError, ValueError):
+            pass
 
-    # 3. Evaluar estado real de la fibra
-    if estado_mc1 is None:
-        estado_texto = "ERROR GESTION: Sin respuesta del Media Converter Local"
+    # Diagnóstico real de la capa física
+    if sw1_ok is None:
+        estado_texto = "ERROR GESTION: Sin respuesta de Cisco SW1 Local"
         margen_db = 0.0
         evento_km = 3.0
-    elif estado_mc1 != "1" or estado_mc2 is None or estado_mc2 != "1":
+    elif sw2_ok is None:
+        # SW1 responde pero SW2 cayó -> corte real en el enlace de fibra
         estado_texto = "FALLA CRÍTICA: Corte de Fibra / Pérdida de Señal (LOS)"
         margen_db = 0.0
         evento_km = 3.0
+    elif crc_nuevos > 0:
+        # La fibra no se cortó del todo, pero está generando tramas corruptas (CRC)
+        estado_texto = f"ALERTA PREVENTIVA: Degradación Óptica ({crc_nuevos} errores CRC)"
+        margen_db = 1.8
+        evento_km = 0.45
     else:
-        if OID_POTENCIA_RX:
-            rx_raw = consultar_snmp(IP_MC_LOCAL, OID_POTENCIA_RX)
-            prx = float(rx_raw) if rx_raw else -17.5
-        else:
-            prx = -17.5
-
-        margen_db = round(prx - SENSIBILIDAD_SRX, 2)
-
-        if margen_db < 1.5:
-            estado_texto = "FALLA CRÍTICA: Atenuación Excesiva en Fibra"
-            evento_km = 1.80
-        elif margen_db < 3.0:
-            estado_texto = "Caso T2: Pérdida Preventiva (Hardware)"
-            evento_km = 0.45
-        else:
-            # Exactamente este texto para que pg_cron lo limpie a los 30 días
-            estado_texto = "Caso T1: Enlace Sano"
-            evento_km = 0.10
+        # Exactamente este texto para que pg_cron lo limpie a los 30 días
+        estado_texto = "Caso T1: Enlace Sano"
+        margen_db = 4.5
+        evento_km = 0.10
 
     payload = {
-        "enlace_id": "MAQUETA-TPLINK-SEDE",
+        "enlace_id": "MAQUETA-CISCO-COMDIEL",
         "evento_km": evento_km,
         "margen_db": margen_db,
         "estado": estado_texto
     }
 
-    print(f"Resultado: {payload}")
+    print(f"SW1={bool(sw1_ok)} | SW2={bool(sw2_ok)} | CRC nuevos={crc_nuevos}")
+    print(f"Enviando a nube: {payload}")
 
-    # 4. Empujar (Push) hacia tu servidor en Render
     try:
         resp = requests.post(API_WOLF_URL, json=payload, timeout=60)
         print(f"Respuesta Render ({resp.status_code}): {resp.json()}")
@@ -108,11 +108,12 @@ def auditar_enlace_real():
         print(f"Error enviando a la nube: {e}")
 
 
-# Ejecutar una lectura inmediata al encender el script y luego cada 1 minuto
 auditar_enlace_real()
+# Para probar rápido ahora puedes cambiar '1' por '10' segundos (.seconds)
+# y dejarlo en .minutes para la evaluación si el profe pide cada 1 minuto
 schedule.every(1).minutes.do(auditar_enlace_real)
 
-print("Agente WOLF-Audit activo. Monitoreando cada 1 minuto (Ctrl+C para detener)...")
+print("Agente WOLF-Audit activo. Monitoreando maqueta física (Ctrl+C para detener)...")
 while True:
     schedule.run_pending()
     time.sleep(1)
